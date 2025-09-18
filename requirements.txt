@@ -1,0 +1,8 @@
+
+fastapi
+uvicorn[standard]
+opencv-python
+mediapipe==0.10.14
+numpy
+# CPU-only PyTorch (Windows/Linux/macOS): pick appropriate index-url for your OS if needed
+torch
