@@ -29,9 +29,9 @@ Create a virtual environment and install deps:
 ```bash
 python -m venv .venv
 /Windows PowerShell
-. .venv/Scripts/Activate.ps1
+ .venv/Scripts/Activate.ps1
 /macOS/Linux
-. source .venv/bin/activate
+ source .venv/bin/activate
 
 pip install -r requirements.txt
 ```
@@ -40,10 +40,6 @@ pip install -r requirements.txt
 > - Windows/Linux (CPU only):  
 >   `pip install torch --index-url https://download.pytorch.org/whl/cpu`
 
-## Put your files
-
-- Model checkpoint: e.g. `fusion_best.pt` (your uploaded file)
-- Labels CSV: e.g. `labels.csv` formatted as `id,label_name`
 
 ## Run (console + health API)
 
