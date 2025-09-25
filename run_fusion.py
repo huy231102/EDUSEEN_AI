@@ -2,6 +2,7 @@
 import os, time, threading, collections, csv, json, asyncio
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
+import base64  # thêm để giải mã ảnh base64 từ FE
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -26,7 +27,7 @@ T_WINDOW    = int(os.getenv("T_WINDOW", "64"))
 IMG_SIZE    = int(os.getenv("HAND_IMG_SIZE", "96"))
 PRINT_EVERY = int(os.getenv("PRINT_EVERY", "2"))
 TOP_K_DEF   = int(os.getenv("TOP_K", "5"))
-AUTO_START  = os.getenv("AUTO_START", "1") == "1"
+AUTO_START  = os.getenv("AUTO_START", "0") == "1"
 API_ONLY    = os.getenv("API_ONLY", "1") == "1"          # 1: no spam console
 
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
@@ -383,6 +384,49 @@ async def ws_feed(ws: WebSocket):
                     snap["topk"] = snap["topk"][:min(k, len(snap["topk"]))]
                 await ws.send_json(snap)
             await asyncio.sleep(0.2)
+    except WebSocketDisconnect:
+        return
+
+# ===================== NEW: Client-stream WebSocket =====================
+@app.websocket("/ws/translate")
+async def ws_translate(ws: WebSocket):
+    """Nhận ảnh JPEG base64 từ FE, trả về nhãn top-1 dạng "label (prob)"."""
+    await ws.accept()
+    # Khởi tạo Mediapipe & sliding window riêng cho từng client
+    _mp_pose, _mp_hands, pose, hands = mp_init()
+    win = SlidingWindow(T_WINDOW, IMG_SIZE)
+    try:
+        while True:
+            data = await ws.receive_text()
+            if not data:
+                continue
+            if data.startswith("data:image"):
+                try:
+                    b64 = data.split(",", 1)[1] if "," in data else data
+                    img_bytes = base64.b64decode(b64)
+                    np_arr = np.frombuffer(img_bytes, np.uint8)
+                    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                except Exception:
+                    continue
+
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pose_res = pose.process(rgb)
+                hands_res = hands.process(rgb)
+
+                kp_vec, has_pose, _nh, L, R, has_left, has_right = extract_keypoints_258(pose_res, hands_res)
+                left_crop = crop_from_landmarks(frame, L, IMG_SIZE)
+                right_crop = crop_from_landmarks(frame, R, IMG_SIZE)
+                win.push(kp_vec, has_pose, left_crop, right_crop, has_left, has_right)
+
+                with torch.no_grad():
+                    kp_t, m_kp_t, left_t, right_t, m_left_t, m_right_t = win.as_tensors()
+                    logits = model(kp_t, m_kp_t, left_t, right_t, m_left_t, m_right_t)
+                    prob_t = F.softmax(logits, dim=-1)[0]
+                    top_p, top_i = torch.topk(prob_t, 1)
+                    idx = int(top_i[0])
+                    label = labels[idx] if 0 <= idx < len(labels) else f"class_{idx}"
+                    conf = float(top_p[0])
+                await ws.send_text(f"{label} ({conf:.2f})")
     except WebSocketDisconnect:
         return
 
