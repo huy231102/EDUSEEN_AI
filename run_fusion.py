@@ -30,6 +30,15 @@ TOP_K_DEF   = int(os.getenv("TOP_K", "5"))
 AUTO_START  = os.getenv("AUTO_START", "0") == "1"
 API_ONLY    = os.getenv("API_ONLY", "1") == "1"          # 1: no spam console
 
+# Nếu chỉ dùng ws/translate, đặt ENABLE_WEBCAM=0 để vô hiệu hóa webcam worker & các route liên quan
+ENABLE_WEBCAM = os.getenv("ENABLE_WEBCAM", "0") == "1"
+
+# ==== THAM SỐ TỐI ƯU SUY LUẬN (giống ai_server.py) ====
+CONFIDENCE_THRESHOLD    = 0.1   # ngưỡng tin cậy tối thiểu
+PREDICTION_HISTORY_SIZE = 5     # chiều dài lịch sử dự đoán
+STABILITY_THRESHOLD     = 3     # số lần xuất hiện để coi là ổn định
+MIN_INTERVAL_SEC        = 0.15  # giãn cách tối thiểu giữa 2 lần infer (~6-7fps)
+
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
 origins = [o.strip() for o in CORS_ORIGINS.split(",")] if CORS_ORIGINS else ["*"]
 
@@ -210,105 +219,115 @@ class SlidingWindow:
 labels: List[str] = load_labels(Path(LABELS_CSV))
 model: Optional[KPHandsFusion] = None
 
-worker_thread: Optional[threading.Thread] = None
-stop_event = threading.Event()
+# Webcam-related tài nguyên chỉ khởi tạo khi ENABLE_WEBCAM
+if ENABLE_WEBCAM:
+    worker_thread: Optional[threading.Thread] = None
+    stop_event = threading.Event()
 
-pred_lock = threading.Lock()
-latest_pred: Dict[str, Any] = {}   # updated every frame
+    pred_lock = threading.Lock()
+    latest_pred: Dict[str, Any] = {}
 
-def set_latest_pred(payload: Dict[str, Any]):
-    with pred_lock:
-        latest_pred.clear()
-        latest_pred.update(payload)
+    def set_latest_pred(payload: Dict[str, Any]):
+        with pred_lock:
+            latest_pred.clear()
+            latest_pred.update(payload)
 
-def get_latest_pred() -> Dict[str, Any]:
-    with pred_lock:
-        return dict(latest_pred) if latest_pred else {}
+    def get_latest_pred() -> Dict[str, Any]:
+        with pred_lock:
+            return dict(latest_pred) if latest_pred else {}
 
-def webcam_worker():
-    cap = cv2.VideoCapture(CAM_INDEX)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
-    ok, _ = cap.read()
-    if not ok:
-        print("[Webcam] Cannot open camera", CAM_INDEX)
-        return
-    _mp_pose, _mp_hands, pose, hands = mp_init()
-    win = SlidingWindow(T_WINDOW, IMG_SIZE)
-    frame_idx = 0
-    interval = 1.0 / max(1e-6, TARGET_FPS)
-    if not API_ONLY:
-        print(f"[Runtime] Started. T={T_WINDOW}, target FPS={TARGET_FPS}, capture={int(cap.get(3))}x{int(cap.get(4))}")
+    def webcam_worker():
+        cap = cv2.VideoCapture(CAM_INDEX)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+        ok, _ = cap.read()
+        if not ok:
+            print("[Webcam] Cannot open camera", CAM_INDEX)
+            return
+        _mp_pose, _mp_hands, pose, hands = mp_init()
+        win = SlidingWindow(T_WINDOW, IMG_SIZE)
+        frame_idx = 0
+        interval = 1.0 / max(1e-6, TARGET_FPS)
+        if not API_ONLY:
+            print(f"[Runtime] Started. T={T_WINDOW}, target FPS={TARGET_FPS}, capture={int(cap.get(3))}x{int(cap.get(4))}")
 
-    while not stop_event.is_set():
-        t0 = time.time()
-        ok, frame = cap.read()
-        if not ok: break
-        frame_idx += 1
+        while not stop_event.is_set():
+            t0 = time.time()
+            ok, frame = cap.read()
+            if not ok: break
+            frame_idx += 1
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pose_res = pose.process(rgb)
-        hands_res = hands.process(rgb)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pose_res = pose.process(rgb)
+            hands_res = hands.process(rgb)
 
-        kp_vec, has_pose, _nh, L, R, has_left, has_right = extract_keypoints_258(pose_res, hands_res)
-        left_crop  = crop_from_landmarks(frame, L, IMG_SIZE)
-        right_crop = crop_from_landmarks(frame, R, IMG_SIZE)
-        win.push(kp_vec, has_pose, left_crop, right_crop, has_left, has_right)
+            kp_vec, has_pose, _nh, L, R, has_left, has_right = extract_keypoints_258(pose_res, hands_res)
+            left_crop  = crop_from_landmarks(frame, L, IMG_SIZE)
+            right_crop = crop_from_landmarks(frame, R, IMG_SIZE)
+            win.push(kp_vec, has_pose, left_crop, right_crop, has_left, has_right)
 
-        with torch.no_grad():
-            kp_t, m_kp_t, left_t, right_t, m_left_t, m_right_t = win.as_tensors()
-            logits = model(kp_t, m_kp_t, left_t, right_t, m_left_t, m_right_t)  # [1,C]
-            probs_t = F.softmax(logits, dim=-1)[0]
-            k = min(TOP_K_DEF, probs_t.numel())
-            top_p, top_i = torch.topk(probs_t, k)
-            top_pairs = []
-            for j in range(k):
-                idx = int(top_i[j])
-                name = labels[idx] if 0 <= idx < len(labels) else f"class_{idx}"
-                top_pairs.append({"index": idx, "label": name, "prob": float(top_p[j])})
+            with torch.no_grad():
+                kp_t, m_kp_t, left_t, right_t, m_left_t, m_right_t = win.as_tensors()
+                logits = model(kp_t, m_kp_t, left_t, right_t, m_left_t, m_right_t)  # [1,C]
+                probs_t = F.softmax(logits, dim=-1)[0]
+                k = min(TOP_K_DEF, probs_t.numel())
+                top_p, top_i = torch.topk(probs_t, k)
+                top_pairs = []
+                for j in range(k):
+                    idx = int(top_i[j])
+                    name = labels[idx] if 0 <= idx < len(labels) else f"class_{idx}"
+                    top_pairs.append({"index": idx, "label": name, "prob": float(top_p[j])})
 
-        payload = {
-            "ts": time.time(),
-            "frame_idx": frame_idx,
-            "topk": top_pairs,
-            "window": T_WINDOW,
-            "capture": {"w": int(cap.get(3)), "h": int(cap.get(4))},
-        }
-        set_latest_pred(payload)
+            payload = {
+                "ts": time.time(),
+                "frame_idx": frame_idx,
+                "topk": top_pairs,
+                "window": T_WINDOW,
+                "capture": {"w": int(cap.get(3)), "h": int(cap.get(4))},
+            }
+            set_latest_pred(payload)
 
-        if not API_ONLY and frame_idx % PRINT_EVERY == 0:
-            head = " | ".join(f"{p['label']}:{p['prob']:.3f}" for p in top_pairs)
-            print(f"[Sign] {top_pairs[0]['label']} (p={top_pairs[0]['prob']:.3f})")
-            print(f"[Top{k}] {head}")
+            if not API_ONLY and frame_idx % PRINT_EVERY == 0:
+                head = " | ".join(f"{p['label']}:{p['prob']:.3f}" for p in top_pairs)
+                print(f"[Sign] {top_pairs[0]['label']} (p={top_pairs[0]['prob']:.3f})")
+                print(f"[Top{k}] {head}")
 
-        dt = time.time() - t0
-        if dt < interval: time.sleep(interval - dt)
+            dt = time.time() - t0
+            if dt < interval: time.sleep(interval - dt)
 
-    cap.release()
-    if not API_ONLY:
-        print("[Webcam] Stopped.")
+        cap.release()
+        if not API_ONLY:
+            print("[Webcam] Stopped.")
 
-def ensure_started():
-    global worker_thread
-    if worker_thread and worker_thread.is_alive():
-        return
-    stop_event.clear()
-    worker_thread = threading.Thread(target=webcam_worker, daemon=True)
-    worker_thread.start()
+    def ensure_started():
+        global worker_thread
+        if worker_thread and worker_thread.is_alive():
+            return
+        stop_event.clear()
+        worker_thread = threading.Thread(target=webcam_worker, daemon=True)
+        worker_thread.start()
 
-def ensure_stopped():
-    if worker_thread and worker_thread.is_alive():
-        stop_event.set()
+    def ensure_stopped():
+        if worker_thread and worker_thread.is_alive():
+            stop_event.set()
+else:
+    # Stub để tránh lỗi khi gọi nhầm
+    def ensure_started():
+        pass
+
+    def ensure_stopped():
+        pass
 
 def _startup_sync():
     global model
     model = load_checkpoint(Path(MODEL_CKPT))
     torch.set_num_threads(max(1, os.cpu_count() or 1))
-    if AUTO_START:
+    if AUTO_START and ENABLE_WEBCAM:
         ensure_started()
 
 def _shutdown_sync():
-    ensure_stopped()
+    if ENABLE_WEBCAM:
+        ensure_stopped()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -324,68 +343,56 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"]
 )
 
-# ===================== ROUTES =====================
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "model_loaded": model is not None,
-        "classes": len(labels),
-        "auto_start": AUTO_START,
-        "running": worker_thread.is_alive() if worker_thread else False,
-        "fps_target": TARGET_FPS,
-        "window": T_WINDOW,
-        "img_size": IMG_SIZE,
-    }
+# ===================== ROUTES WEBCAM (tùy chọn) =====================
+if ENABLE_WEBCAM:
+    @app.post("/control/start")
+    def api_start():
+        ensure_started()
+        return {"started": True}
 
-@app.post("/control/start")
-def api_start():
-    ensure_started()
-    return {"started": True}
+    @app.post("/control/stop")
+    def api_stop():
+        ensure_stopped()
+        return {"stopped": True}
 
-@app.post("/control/stop")
-def api_stop():
-    ensure_stopped()
-    return {"stopped": True}
+    @app.get("/predict/latest")
+    def api_latest(k: int = TOP_K_DEF):
+        snap = get_latest_pred()
+        if not snap:
+            return JSONResponse({"error": "no_prediction_yet"}, status_code=404)
+        if k > 0 and "topk" in snap:
+            snap["topk"] = snap["topk"][:min(k, len(snap["topk"]))]
+        return snap
 
-@app.get("/predict/latest")
-def api_latest(k: int = TOP_K_DEF):
-    snap = get_latest_pred()
-    if not snap:
-        return JSONResponse({"error": "no_prediction_yet"}, status_code=404)
-    if k > 0 and "topk" in snap:
-        snap["topk"] = snap["topk"][:min(k, len(snap["topk"]))]
-    return snap
+    @app.get("/predict/stream")
+    async def api_stream(k: int = TOP_K_DEF, interval_ms: int = 200):
+        async def gen():
+            while True:
+                snap = get_latest_pred()
+                if snap:
+                    if k > 0 and "topk" in snap:
+                        snap["topk"] = snap["topk"][:min(k, len(snap["topk"]))]
+                    yield f"data: {json.dumps(snap)}\n\n"
+                await asyncio.sleep(max(0.05, interval_ms/1000))
+        return StreamingResponse(gen(), media_type="text/event-stream")
 
-@app.get("/predict/stream")
-async def api_stream(k: int = TOP_K_DEF, interval_ms: int = 200):
-    async def gen():
-        while True:
-            snap = get_latest_pred()
-            if snap:
-                if k > 0 and "topk" in snap:
-                    snap["topk"] = snap["topk"][:min(k, len(snap["topk"]))]
-                yield f"data: {json.dumps(snap)}\n\n"
-            await asyncio.sleep(max(0.05, interval_ms/1000))
-    return StreamingResponse(gen(), media_type="text/event-stream")
-
-@app.websocket("/ws")
-async def ws_feed(ws: WebSocket):
-    await ws.accept()
-    try:
+    @app.websocket("/ws")
+    async def ws_feed(ws: WebSocket):
+        await ws.accept()
         try:
-            k = int(ws.query_params.get("k", TOP_K_DEF))  # type: ignore
-        except Exception:
-            k = TOP_K_DEF
-        while True:
-            snap = get_latest_pred()
-            if snap:
-                if k > 0 and "topk" in snap:
-                    snap["topk"] = snap["topk"][:min(k, len(snap["topk"]))]
-                await ws.send_json(snap)
-            await asyncio.sleep(0.2)
-    except WebSocketDisconnect:
-        return
+            try:
+                k = int(ws.query_params.get("k", TOP_K_DEF))  # type: ignore
+            except Exception:
+                k = TOP_K_DEF
+            while True:
+                snap = get_latest_pred()
+                if snap:
+                    if k > 0 and "topk" in snap:
+                        snap["topk"] = snap["topk"][:min(k, len(snap["topk"]))]
+                    await ws.send_json(snap)
+                await asyncio.sleep(0.2)
+        except WebSocketDisconnect:
+            return
 
 # ===================== NEW: Client-stream WebSocket =====================
 @app.websocket("/ws/translate")
@@ -395,6 +402,10 @@ async def ws_translate(ws: WebSocket):
     # Khởi tạo Mediapipe & sliding window riêng cho từng client
     _mp_pose, _mp_hands, pose, hands = mp_init()
     win = SlidingWindow(T_WINDOW, IMG_SIZE)
+    last_sent_label: Optional[str] = None  # theo dõi nhãn đã gửi cuối cùng
+    prediction_history = []
+    import time
+    last_infer = 0.0
     try:
         while True:
             data = await ws.receive_text()
@@ -416,6 +427,22 @@ async def ws_translate(ws: WebSocket):
                 kp_vec, has_pose, _nh, L, R, has_left, has_right = extract_keypoints_258(pose_res, hands_res)
                 left_crop = crop_from_landmarks(frame, L, IMG_SIZE)
                 right_crop = crop_from_landmarks(frame, R, IMG_SIZE)
+
+                # Nếu không phát hiện tay nào → reset và gửi chuỗi rỗng
+                if not has_left and not has_right:
+                    if last_sent_label is not None:
+                        print("--- GỬI VỀ FRONTEND: '' (Tín hiệu xóa) ---")
+                        await ws.send_text("")
+                        prediction_history.clear()
+                        last_sent_label = None
+                    continue  # bỏ qua infer
+
+                # Giới hạn tốc độ suy luận
+                now = time.time()
+                if now - last_infer < MIN_INTERVAL_SEC:
+                    continue
+                last_infer = now
+
                 win.push(kp_vec, has_pose, left_crop, right_crop, has_left, has_right)
 
                 with torch.no_grad():
@@ -426,7 +453,25 @@ async def ws_translate(ws: WebSocket):
                     idx = int(top_i[0])
                     label = labels[idx] if 0 <= idx < len(labels) else f"class_{idx}"
                     conf = float(top_p[0])
-                await ws.send_text(f"{label} ({conf:.2f})")
+                # =======  Hậu xử lý ổn định dự đoán  =======
+                if conf > CONFIDENCE_THRESHOLD:
+                    prediction_history.append(label)
+                    if len(prediction_history) > PREDICTION_HISTORY_SIZE:
+                        prediction_history.pop(0)
+
+                    if prediction_history:
+                        most_common = max(set(prediction_history), key=prediction_history.count)
+                        if prediction_history.count(most_common) >= STABILITY_THRESHOLD:
+                            if most_common != last_sent_label:
+                                last_sent_label = most_common
+                                response = f"{most_common} ({conf:.2f})"
+                                print(f"--- GỬI VỀ FRONTEND: '{response}' ---")
+                                await ws.send_text(response)
+                                # reset history để nhận nhanh ký tự kế tiếp
+                                prediction_history.clear()
+                else:
+                    # độ tin cậy thấp → không thêm vào lịch sử
+                    pass
     except WebSocketDisconnect:
         return
 
